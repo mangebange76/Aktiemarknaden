@@ -1,0 +1,5 @@
+# aldrig committa hemligheter eller cache
+.streamlit/
+cache.db
+__pycache__/
+*.pyc
