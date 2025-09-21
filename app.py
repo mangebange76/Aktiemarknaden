@@ -13,7 +13,7 @@ from fmp_client import (
     list_universe, sectors_in_universe, industries_in_universe,
     quote_batch, financial_ratios_ttm, key_metrics_ttm,
     historical_key_metrics, income_statement, cashflow_statement,
-    batch_safe, index_symbols
+    batch_safe, index_symbols, test_fmp
 )
 from fx_utils import convert as fx_convert, fx_rate
 from metrics import (
@@ -26,7 +26,8 @@ from sheets_utils import read_df, write_df
 st.set_page_config(page_title="Global Screener – Pro", layout="wide")
 st.title("🌐 Pro Screener – multi-marknad, peer-z, EV/EBIT(DA), FCF-yield, cache, backtest & Sheets")
 
-FMP_API_KEY = os.environ.get("FMP_API_KEY") or st.secrets.get("FMP_API_KEY")
+# Läs FMP-nyckeln som indikator för varning (själva klienten använder st.secrets inne i modulen)
+FMP_API_KEY = st.secrets.get("FMP_API_KEY") or os.environ.get("FMP_API_KEY")
 SHEET_URL   = st.secrets.get("SHEET_URL", "")
 SHEET_NAME  = st.secrets.get("SHEET_NAME", "Bolag")
 CACHE_DB    = "cache.db"
@@ -173,6 +174,14 @@ with st.sidebar:
     w_deb = st.slider("Vikt: Skuld",    0.0, 1.0, 0.20, 0.05)
     de_cap = st.number_input("Max D/E för full skuldbetygsvikt", 0.1, 10.0, 1.0, 0.1)
 
+    st.header("🔌 Test")
+    if st.button("Testa FMP-anslutning"):
+        ok, msg = test_fmp("AAPL")
+        if ok:
+            st.success(msg)
+        else:
+            st.error(msg)
+
 
 # ----------------------------- 1) Välj presets (multi) -----------------------------
 st.subheader("1) Välj marknader/index (multi-val)")
@@ -223,11 +232,17 @@ if st.button("Hämta universum för valda presets"):
     if not chosen:
         st.warning("Välj minst ett preset.")
     else:
+        errors = []
         with st.spinner("Hämtar tickers…"):
             for k in chosen:
-                preset_universes[k] = gather_symbols_from_preset(k)
+                try:
+                    preset_universes[k] = gather_symbols_from_preset(k)
+                except Exception as ex:
+                    errors.append(f"{k}: {ex}")
         total = sum(len(v) for v in preset_universes.values())
         st.success(f"Klar. {len(preset_universes)} presets, totalt {total} tickers.")
+        if errors:
+            st.warning("Några presets misslyckades:\n- " + "\n- ".join(errors))
 
 
 # ----------------------------- 2) Massuppdatera & beräkna -----------------------------
