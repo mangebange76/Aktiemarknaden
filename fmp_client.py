@@ -1,211 +1,115 @@
+# aktiemarknaden/fmp_client.py
+from __future__ import annotations
 import os
-import time
-from typing import List, Dict, Optional, Tuple
-
+from typing import Iterable, List, Optional, Dict, Any, Union
 import requests
 
-FMP_BASE = "https://financialmodelingprep.com/api/v3"
+BASE_URL = "https://financialmodelingprep.com/stable"
 
-# --- Hämta API-nyckeln säkert: st.secrets först, annars env ---
-try:
-    import streamlit as st  # kan saknas i vissa sammanhang → därför try/except
-    _ST_FMP = st.secrets.get("FMP_API_KEY", None)
-except Exception:
-    _ST_FMP = None
-
-API_KEY = _ST_FMP or os.environ.get("FMP_API_KEY")
-
-
-def _get(path: str, params: Dict = None, timeout: int = 25):
-    """
-    Bas-GEt mot FMP med tydlig felhantering och maskering av apikey i feltext.
-    """
-    if params is None:
-        params = {}
-
-    key = API_KEY or params.get("apikey")
-    if not key:
-        raise RuntimeError(
-            "FMP_API_KEY saknas. Lägg till i Streamlit Secrets som FMP_API_KEY (utanför [GOOGLE_CREDENTIALS])."
-        )
-
-    params["apikey"] = key
-    url = f"{FMP_BASE}/{path}"
-    r = requests.get(url, params=params, timeout=timeout)
-
-    # Enkel backoff vid 429 (rate limit)
-    if r.status_code == 429:
-        time.sleep(1.2)
-        r = requests.get(url, params=params, timeout=timeout)
-
+def _get_api_key() -> Optional[str]:
+    # Miljövariabel först
+    key = os.environ.get("FMP_API_KEY")
+    if key:
+        return key
+    # Streamlit secrets om det finns
     try:
-        r.raise_for_status()
-    except requests.HTTPError as e:
-        # Lägg med en kort snippet men maska bort nyckeln
-        snippet = (r.text or "")[:300].replace(key, "***")
-        raise requests.HTTPError(f"FMP HTTP {r.status_code} på {path}. Svar: {snippet}") from e
-
-    # FMP kan svara med text även vid 200 i vissa edgefall; försök json först
-    try:
-        return r.json()
+        import streamlit as st  # type: ignore
+        key = st.secrets.get("FMP_API_KEY")  # pyright: ignore[reportOptionalMemberAccess]
+        if key:
+            return str(key)
     except Exception:
-        return {"raw": r.text}
+        pass
+    return None
 
+def _symbols_param(symbols: Union[str, Iterable[str]]) -> str:
+    if isinstance(symbols, str):
+        return symbols.strip().upper()
+    return ",".join(sorted({s.strip().upper() for s in symbols if s and s.strip()}))
 
-# ----------------------------- Universe/Screener -----------------------------
-def list_universe(exchange: Optional[str] = None,
-                  country: Optional[str] = None,
-                  sector: Optional[str] = None,
-                  industry: Optional[str] = None,
-                  limit: int = 100000) -> List[Dict]:
+def _get(endpoint: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    params = dict(params or {})
+    apikey = _get_api_key()
+    if apikey:
+        params["apikey"] = apikey
+    url = f"{BASE_URL}/{endpoint}"
+    r = requests.get(url, params=params, timeout=30)
+    # FMP skickar ett tydligt meddelande vid legacy-route
+    if r.status_code == 403 and "Legacy" in (r.text or ""):
+        raise RuntimeError(
+            f"FMP 403 Legacy Endpoint på {url}. Byt till /stable-varianten av endpointen."
+        )
+    r.raise_for_status()
+    data = r.json()
+    return data
+
+# ---------- DIRECTORY / UNIVERSE ----------
+def list_universe(
+    exchange: Optional[str] = None,
+    country: Optional[str] = None,
+    page: int = 0,
+    limit: int = 10000,
+    **filters: Any,
+) -> List[Dict[str, Any]]:
     """
-    Global screener. Använd exchange ('NASDAQ','NYSE','STO','OSE','CPH','HEL','FWB','LSE','TSX','TSXV'…)
-    eller country ('United States','Sweden','Norway','Denmark','Finland','Germany','United Kingdom','Canada', 'Europe').
+    Hämtar tickers via nya company-screener (ersätter stock-screener).
+    Vanliga filter: exchange, sector, industry, priceMoreThan, marketCapMoreThan, isEtf, isActivelyTrading etc.
     """
-    params = {"limit": limit}
-    if exchange: params["exchange"] = exchange
-    if country:  params["country"]  = country
-    if sector:   params["sector"]   = sector
-    if industry: params["industry"] = industry
-    data = _get("stock-screener", params=params)
-    # FMP returnerar ibland {"Error Message": "..."} – fånga det
-    if isinstance(data, dict) and "Error Message" in data:
-        raise requests.HTTPError(f"FMP fel: {data['Error Message']}")
-    return [d for d in data if isinstance(d, dict) and d.get("symbol")]
+    params: Dict[str, Any] = {"page": page, "limit": limit}
+    if exchange:
+        params["exchange"] = exchange
+    if country:
+        params["country"] = country
+    params.update({k: v for k, v in filters.items() if v is not None})
+    return _get("company-screener", params=params)
 
+def list_symbols_all() -> List[Dict[str, Any]]:
+    """Full symbol-lista (alla marknader)"""
+    return _get("stock-list")
 
-def sectors_in_universe(exchange: Optional[str] = None, country: Optional[str] = None) -> List[str]:
-    rows = list_universe(exchange=exchange, country=country, limit=50000)
-    return sorted({r.get("sector") for r in rows if r.get("sector")})
-
-
-def industries_in_universe(exchange: Optional[str] = None, country: Optional[str] = None, sector: Optional[str] = None) -> List[str]:
-    rows = list_universe(exchange=exchange, country=country, sector=sector, limit=50000)
-    return sorted({r.get("industry") for r in rows if r.get("industry")})
-
-
-# ----------------------------- Quotes/Financials -----------------------------
-def quote_batch(symbols: List[str]) -> List[Dict]:
-    if not symbols:
-        return []
-    out = []
-    CHUNK = 150
-    for i in range(0, len(symbols), CHUNK):
-        chunk = ",".join(symbols[i:i+CHUNK])
-        data = _get(f"quote/{chunk}")
-        if isinstance(data, dict) and "Error Message" in data:
-            raise requests.HTTPError(f"FMP fel: {data['Error Message']}")
-        out.extend(data if isinstance(data, list) else [])
-        time.sleep(0.35)
+def available_sectors() -> List[str]:
+    out = _get("available-sectors")
+    # FMP returnerar ibland som list of dicts; normalisera till str-lista
+    if out and isinstance(out, list) and isinstance(out[0], dict) and "sector" in out[0]:
+        return [x.get("sector") for x in out if "sector" in x]
     return out
 
+def available_industries() -> List[str]:
+    out = _get("available-industries")
+    if out and isinstance(out, list) and isinstance(out[0], dict) and "industry" in out[0]:
+        return [x.get("industry") for x in out if "industry" in x]
+    return out
 
-def financial_ratios_ttm(symbol: str) -> Dict:
-    fr = _get(f"ratios-ttm/{symbol}")
-    return fr[0] if isinstance(fr, list) and fr else {}
+# ---------- INDEX KONSTITUENTER ----------
+def sp500_constituents() -> List[Dict[str, Any]]:
+    return _get("sp500-constituent")
 
+def nasdaq_constituents() -> List[Dict[str, Any]]:
+    return _get("nasdaq-constituent")
 
-def key_metrics_ttm(symbol: str) -> Dict:
-    km = _get(f"key-metrics-ttm/{symbol}")
-    return km[0] if isinstance(km, list) and km else {}
+# ---------- QUOTES & PROFIL ----------
+def get_quote(symbols: Union[str, Iterable[str]]) -> List[Dict[str, Any]]:
+    return _get("quote", params={"symbol": _symbols_param(symbols)})
 
+def get_profile(symbols: Union[str, Iterable[str]]) -> List[Dict[str, Any]]:
+    # NYTT: profile kräver ?symbol=... (inte /profile/{sym})
+    return _get("profile", params={"symbol": _symbols_param(symbols)})
 
-def historical_key_metrics(symbol: str, period: str = "annual", limit: int = 6) -> List[Dict]:
-    return _get(f"historical-key-metrics/{symbol}", params={"period": period, "limit": limit}) or []
+# ---------- NYCKELTAL ----------
+def get_ratios_ttm(symbols: Union[str, Iterable[str]]) -> List[Dict[str, Any]]:
+    return _get("ratios-ttm", params={"symbol": _symbols_param(symbols)})
 
+def get_key_metrics_ttm(symbols: Union[str, Iterable[str]]) -> List[Dict[str, Any]]:
+    return _get("key-metrics-ttm", params={"symbol": _symbols_param(symbols)})
 
-def income_statement(symbol: str, period: str = "annual", limit: int = 6) -> List[Dict]:
-    return _get(f"income-statement/{symbol}", params={"period": period, "limit": limit}) or []
+def get_key_metrics_history(
+    symbol: str, period: str = "annual", limit: int = 20
+) -> List[Dict[str, Any]]:
+    return _get("key-metrics", params={"symbol": symbol.upper(), "period": period, "limit": limit})
 
+# ---------- FINANSIELLA RAPPORTER ----------
+def get_income_statement(symbol: str, period: str = "annual", limit: int = 8) -> List[Dict[str, Any]]:
+    return _get("income-statement", params={"symbol": symbol.upper(), "period": period, "limit": limit})
 
-def cashflow_statement(symbol: str, period: str = "annual", limit: int = 6) -> List[Dict]:
-    return _get(f"cash-flow-statement/{symbol}", params={"period": period, "limit": limit}) or []
-
-
-def batch_safe(iterable, chunk_size):
-    for i in range(0, len(iterable), chunk_size):
-        yield iterable[i:i+chunk_size]
-
-
-# ----------------------------- Index presets -----------------------------
-def _index_api_symbols(path: Optional[str]) -> List[str]:
-    if not path:
-        return []
-    try:
-        data = _get(path)
-        syms = []
-        for r in data:
-            s = r.get("symbol") or r.get("Symbol") or r.get("ticker")
-            if s:
-                syms.append(s)
-        return syms
-    except Exception:
-        return []
-
-
-def index_symbols(index_code: str) -> List[str]:
-    """
-    API-först. Fallback: använd exchange/land som proxy om listan saknas.
-    Täcker USA, Sverige, Norge, Danmark, Finland, Kanada, Tyskland, UK.
-    """
-    code = index_code.upper()
-    path_map = {
-        # USA
-        "SP500": "sp500_constituent",
-        "NDX":   "nasdaq_constituent",     # Nasdaq-100
-        "DOW":   "dowjones_constituent",
-        # Sverige/Europa
-        "OMXS30":   "omxs30_constituent",
-        "OMXSB":    "omx_stockholm_benchmark_constituent",
-        "OMXS30GI": "omxs30_gi_constituent",
-        "STOXX600": "stoxx600_constituent",
-        "STOXX50E": "stoxx50e_constituent",
-        # Övriga (fallback via exchange)
-        "DAX": None, "MDAX": None, "SDAX": None, "TECDAX": None,
-        "FTSE100": None, "FTSE250": None,
-        "TSXCOMP": None, "TSXV": None,
-        "OBX": None, "OSEBX": None,
-        "OMXC25": None, "OMXH25": None,
-    }
-    syms = _index_api_symbols(path_map.get(code))
-    if syms:
-        return syms
-
-    # Fallback – proxy via exchange
-    rows: List[Dict] = []
-    if code in ("DAX","MDAX","SDAX","TECDAX"):
-        rows = list_universe(exchange="FWB", limit=50000)
-    elif code in ("FTSE100","FTSE250"):
-        rows = list_universe(exchange="LSE", limit=50000)
-    elif code == "TSXCOMP":
-        rows = list_universe(exchange="TSX", limit=50000)
-    elif code == "TSXV":
-        rows = list_universe(exchange="TSXV", limit=50000)
-    elif code in ("OBX","OSEBX"):
-        rows = list_universe(exchange="OSE", limit=50000)
-    elif code == "OMXC25":
-        rows = list_universe(exchange="CPH", limit=50000)
-    elif code == "OMXH25":
-        rows = list_universe(exchange="HEL", limit=50000)
-    elif code in ("OMXS30","OMXSB","OMXS30GI"):
-        rows = list_universe(exchange="STO", limit=50000)
-    elif code in ("SP500","NDX","DOW"):
-        rows = list_universe(country="United States", limit=50000)
-    elif code in ("STOXX600","STOXX50E"):
-        rows = list_universe(country="Europe", limit=50000)
-    return [r["symbol"] for r in rows if r.get("symbol")]
-
-
-# ----------------------------- Hjälp: testa nyckeln -----------------------------
-def test_fmp(symbol: str = "AAPL") -> Tuple[bool, str]:
-    """
-    Enkel hälsokoll: hämtar profile för en symbol.
-    Returnerar (ok, meddelande).
-    """
-    try:
-        data = _get(f"profile/{symbol}")
-        if isinstance(data, list) and data:
-            return True, "FMP-anslutning OK."
-        return False, "Oväntat svar från FMP (ingen data)."
-    except Exception as e:
-        return False, str(e)
+def get_cashflow_statement(symbol: str, period: str = "annual", limit: int = 8) -> List[Dict[str, Any]]:
+    # OBS: cashflow-statement i stable
+    return _get("cashflow-statement", params={"symbol": symbol.upper(), "period": period, "limit": limit})
