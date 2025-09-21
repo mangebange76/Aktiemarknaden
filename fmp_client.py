@@ -1,22 +1,55 @@
 import os
 import time
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import requests
 
 FMP_BASE = "https://financialmodelingprep.com/api/v3"
-API_KEY = os.environ.get("FMP_API_KEY") or os.getenv("FMP_API_KEY")
+
+# --- Hämta API-nyckeln säkert: st.secrets först, annars env ---
+try:
+    import streamlit as st  # kan saknas i vissa sammanhang → därför try/except
+    _ST_FMP = st.secrets.get("FMP_API_KEY", None)
+except Exception:
+    _ST_FMP = None
+
+API_KEY = _ST_FMP or os.environ.get("FMP_API_KEY")
 
 
-# ----------------------------- Low-level -----------------------------
 def _get(path: str, params: Dict = None, timeout: int = 25):
+    """
+    Bas-GEt mot FMP med tydlig felhantering och maskering av apikey i feltext.
+    """
     if params is None:
         params = {}
-    if "apikey" not in params:
-        params["apikey"] = API_KEY
-    r = requests.get(f"{FMP_BASE}/{path}", params=params, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
+
+    key = API_KEY or params.get("apikey")
+    if not key:
+        raise RuntimeError(
+            "FMP_API_KEY saknas. Lägg till i Streamlit Secrets som FMP_API_KEY (utanför [GOOGLE_CREDENTIALS])."
+        )
+
+    params["apikey"] = key
+    url = f"{FMP_BASE}/{path}"
+    r = requests.get(url, params=params, timeout=timeout)
+
+    # Enkel backoff vid 429 (rate limit)
+    if r.status_code == 429:
+        time.sleep(1.2)
+        r = requests.get(url, params=params, timeout=timeout)
+
+    try:
+        r.raise_for_status()
+    except requests.HTTPError as e:
+        # Lägg med en kort snippet men maska bort nyckeln
+        snippet = (r.text or "")[:300].replace(key, "***")
+        raise requests.HTTPError(f"FMP HTTP {r.status_code} på {path}. Svar: {snippet}") from e
+
+    # FMP kan svara med text även vid 200 i vissa edgefall; försök json först
+    try:
+        return r.json()
+    except Exception:
+        return {"raw": r.text}
 
 
 # ----------------------------- Universe/Screener -----------------------------
@@ -35,7 +68,10 @@ def list_universe(exchange: Optional[str] = None,
     if sector:   params["sector"]   = sector
     if industry: params["industry"] = industry
     data = _get("stock-screener", params=params)
-    return [d for d in data if d.get("symbol")]
+    # FMP returnerar ibland {"Error Message": "..."} – fånga det
+    if isinstance(data, dict) and "Error Message" in data:
+        raise requests.HTTPError(f"FMP fel: {data['Error Message']}")
+    return [d for d in data if isinstance(d, dict) and d.get("symbol")]
 
 
 def sectors_in_universe(exchange: Optional[str] = None, country: Optional[str] = None) -> List[str]:
@@ -57,7 +93,9 @@ def quote_batch(symbols: List[str]) -> List[Dict]:
     for i in range(0, len(symbols), CHUNK):
         chunk = ",".join(symbols[i:i+CHUNK])
         data = _get(f"quote/{chunk}")
-        out.extend(data)
+        if isinstance(data, dict) and "Error Message" in data:
+            raise requests.HTTPError(f"FMP fel: {data['Error Message']}")
+        out.extend(data if isinstance(data, list) else [])
         time.sleep(0.35)
     return out
 
@@ -73,15 +111,15 @@ def key_metrics_ttm(symbol: str) -> Dict:
 
 
 def historical_key_metrics(symbol: str, period: str = "annual", limit: int = 6) -> List[Dict]:
-    return _get(f"historical-key-metrics/{symbol}", params={"period": period, "limit": limit})
+    return _get(f"historical-key-metrics/{symbol}", params={"period": period, "limit": limit}) or []
 
 
 def income_statement(symbol: str, period: str = "annual", limit: int = 6) -> List[Dict]:
-    return _get(f"income-statement/{symbol}", params={"period": period, "limit": limit})
+    return _get(f"income-statement/{symbol}", params={"period": period, "limit": limit}) or []
 
 
 def cashflow_statement(symbol: str, period: str = "annual", limit: int = 6) -> List[Dict]:
-    return _get(f"cash-flow-statement/{symbol}", params={"period": period, "limit": limit})
+    return _get(f"cash-flow-statement/{symbol}", params={"period": period, "limit": limit}) or []
 
 
 def batch_safe(iterable, chunk_size):
@@ -134,25 +172,40 @@ def index_symbols(index_code: str) -> List[str]:
         return syms
 
     # Fallback – proxy via exchange
+    rows: List[Dict] = []
     if code in ("DAX","MDAX","SDAX","TECDAX"):
-        rows = list_universe(exchange="FWB", limit=50000); return [r["symbol"] for r in rows if r.get("symbol")]
-    if code in ("FTSE100","FTSE250"):
-        rows = list_universe(exchange="LSE", limit=50000); return [r["symbol"] for r in rows if r.get("symbol")]
-    if code == "TSXCOMP":
-        rows = list_universe(exchange="TSX", limit=50000);  return [r["symbol"] for r in rows if r.get("symbol")]
-    if code == "TSXV":
-        rows = list_universe(exchange="TSXV", limit=50000); return [r["symbol"] for r in rows if r.get("symbol")]
-    if code in ("OBX","OSEBX"):
-        rows = list_universe(exchange="OSE", limit=50000);  return [r["symbol"] for r in rows if r.get("symbol")]
-    if code == "OMXC25":
-        rows = list_universe(exchange="CPH", limit=50000);  return [r["symbol"] for r in rows if r.get("symbol")]
-    if code == "OMXH25":
-        rows = list_universe(exchange="HEL", limit=50000);  return [r["symbol"] for r in rows if r.get("symbol")]
-    if code in ("OMXS30","OMXSB","OMXS30GI"):
-        rows = list_universe(exchange="STO", limit=50000);  return [r["symbol"] for r in rows if r.get("symbol")]
-    if code in ("SP500","NDX","DOW"):
-        rows = list_universe(country="United States", limit=50000); return [r["symbol"] for r in rows if r.get("symbol")]
-    if code in ("STOXX600","STOXX50E"):
-        rows = list_universe(country="Europe", limit=50000); return [r["symbol"] for r in rows if r.get("symbol")]
+        rows = list_universe(exchange="FWB", limit=50000)
+    elif code in ("FTSE100","FTSE250"):
+        rows = list_universe(exchange="LSE", limit=50000)
+    elif code == "TSXCOMP":
+        rows = list_universe(exchange="TSX", limit=50000)
+    elif code == "TSXV":
+        rows = list_universe(exchange="TSXV", limit=50000)
+    elif code in ("OBX","OSEBX"):
+        rows = list_universe(exchange="OSE", limit=50000)
+    elif code == "OMXC25":
+        rows = list_universe(exchange="CPH", limit=50000)
+    elif code == "OMXH25":
+        rows = list_universe(exchange="HEL", limit=50000)
+    elif code in ("OMXS30","OMXSB","OMXS30GI"):
+        rows = list_universe(exchange="STO", limit=50000)
+    elif code in ("SP500","NDX","DOW"):
+        rows = list_universe(country="United States", limit=50000)
+    elif code in ("STOXX600","STOXX50E"):
+        rows = list_universe(country="Europe", limit=50000)
+    return [r["symbol"] for r in rows if r.get("symbol")]
 
-    return []
+
+# ----------------------------- Hjälp: testa nyckeln -----------------------------
+def test_fmp(symbol: str = "AAPL") -> Tuple[bool, str]:
+    """
+    Enkel hälsokoll: hämtar profile för en symbol.
+    Returnerar (ok, meddelande).
+    """
+    try:
+        data = _get(f"profile/{symbol}")
+        if isinstance(data, list) and data:
+            return True, "FMP-anslutning OK."
+        return False, "Oväntat svar från FMP (ingen data)."
+    except Exception as e:
+        return False, str(e)
